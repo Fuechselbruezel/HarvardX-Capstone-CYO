@@ -97,7 +97,7 @@ accuracy <- function(y_actual, y_predicted) {
 
 ## Train/Test set ----------------------------------------------------------------
 
-# using seed for reproducibility, set p to 0.005 to create 0.5% subset
+# using seed for reproducibility
 # split dataset into training and test set by 80%, 20% respectively
 set.seed(1234, sample.kind = "Rounding")
 p <- 0.2
