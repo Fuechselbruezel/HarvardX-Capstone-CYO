@@ -1,0 +1,376 @@
+---
+title: "Classifying Near-Earth Objects"
+subtitle: "HarvardX 125.9x Capstone Project Part 2 - CYO"
+author: "Julian Fuchs"
+date: "`r format(Sys.Date(),format='%B %d, %Y')`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    df_print: kable
+header-includes:
+   - \usepackage{float}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(fig.pos = 'H')
+knitr::opts_chunk$set(fig.align = 'center')
+
+library(tidyverse)
+library(caret)
+library(DescTools)
+library(lubridate)
+library(kableExtra)
+library(gridExtra)
+library(rpart)
+library(rpart.plot)
+
+goal_accuracy <- 0.95
+```
+
+\newpage{}
+
+# Introduction
+
+## Motivation
+
+This is the second assignment on the edX HarvardX 125.9x Data Science Capstone course. The goal of this project is to build a machine learning algorithm to classify if an near earth object is hazardous or not. Our aim is to build an algorithm with an accuracy $\geq$ `r goal_accuracy*100`%. The Dataset used in this project is provided by Ivansher on Kaggle[[1]](https://www.kaggle.com/datasets/ivansher/nasa-nearest-earth-objects-1910-2024/data). A copy of the Dataset is provided on the Github Repository of this project[[2]](https://github.com/Fuechselbruezel/HarvardX-Capstone-CYO).
+
+## The Dataset
+
+Classifying Near-Earth Objects (NEO) sound amazing, but what is a Near-Earth Object? A NEO is described as asteroids or comets, which were formed about 4.6 billion years ago alongside with the planets of our solar system and come near earth on their way threw space[[3]](https://cneos.jpl.nasa.gov/about/basics.html). Some of which could be a potential threat to us as an impact could, depending on the object, have catastrophic consequences. We are trying to classify if the objects, included in the dataset, pose a threat or not.
+The Dataset contains observations from 1910 - 2024.
+
+```{r dataset setup, include=FALSE, cache=TRUE}
+
+data <- "./nearest-earth-objects.csv"
+git_link <- "https://raw.githubusercontent.com/Fuechselbruezel/HarvardX-Capstone-CYO/refs/heads/main/nearest-earth-objects.csv"
+
+if (!file.exists(data)) {
+      tryCatch({
+        download.file(git_link, data, method = "curl")
+        print("File downloaded successfully")
+      }, error = function(e) {
+        stop(cat("Error downloading the file:", e$message, "\n"))
+      })
+   }
+
+neo <- read_csv(data)
+rm(data, git_link)
+
+```
+
+The dataset includes the predictor as well as 8 Features with `r nrow(neo)` observations:
+
+-   **Predictor:** is_hazardous: A logical value indicating if the object is hazardous
+
+-   **Features:**
+
+    -   **neo_id:** Unique Identifier for each Object
+    -   **name:** The name of the Object given by NASA
+    -   **absoulute_magnitude:** Intrinsic luminosity
+    -   **estimated_diameter_min:** Minimum Estimated Diameter in Kilometres
+    -   **estimated_diameter_max:** Maximum Estimated Diameter in Kilometres
+    -   **orbiting_body:** Name of the planet the object is orbiting
+    -   **relative_velocity:** Velocity Relative to Earth in Kmph
+    -   **miss_distance:** Distance in Kilometres missed
+
+The following Sections will guide you through the Data cleaning and exploration, how we choose a final model using the Recursive Partitioning, Gradient Boost and Random Forest algorithms to make our predictions and a Conclusion of the Project.
+
+\newpage{}
+
+# Analysis
+
+## Cleaning the Data
+
+```{r na, tab.cap="NA Count"}
+kable(colSums(is.na(neo)), col.names = c("Name","NA Count"))
+
+neo <- na.omit(neo)
+```
+
+As you can see in Table 1 there are some missing values ("NA") in our Data. Most of the algorithms/techniques used can't deal with NA-Values. As the NA/Observations ratio is quite small we can simply remove the rows containing NA's.
+
+
+The *orbiting_body* feature is the name of the planet the object is orbiting. The problem with this feature is that it has only one unique value: "Earth", as you can see in Table 2. As they are all near earth objects it makes sense but unfortunately it won't be helpful to our analysis. So we can ignore the Feature completely. The same problem applies to the *name* feature as it is a character vector we can't really do anything with it so we will drop it. As our Data is now cleaned we can go one step further into the exploration.
+
+```{r Drop Earth, message=FALSE, warning=FALSE, tab.cap="Unique Values"}
+neo$orbiting_body %>% as_tibble() %>% count(value) %>% kable(col.names = c("Value","Count"))
+neo$orbiting_body <- NULL
+neo$name <- NULL
+```
+
+## Exploring the Data
+
+By exploring the data, we can draw first assumptions about the relationships between features and the predictor and to gain a first insight at what algorithm might be useful. A standard linear model $y=ax+b$ would be one of the most basic approaches. A good starting point is to look at the Correlation between the features and the predictor.
+
+```{r correlation, tab.cap="Correlation"}
+neo %>%  
+  cor() %>% 
+  as.data.frame() %>%
+  select(is_hazardous)
+```
+
+As you can see in Table 3 *absolute_magnitude* and *is_hazardous* have the strongest linear relationship. However as -0.3 is not enough to build a good standard linear model, we have to think about other algorithms.
+
+```{r vis setup, message=FALSE, warning=FALSE}
+set.seed(007, sample.kind = "Rounding")
+p_vis <- 0.005
+index <- createDataPartition(y = neo$is_hazardous, p = p_vis, list = FALSE)
+neo_vis <- neo[index,]
+rm(index)
+```
+
+Because there are more than `r round(nrow(neo)/100000)*100`k data points per feature in the original Dataset, drawing conclusions would be quite difficult. So, in the following plots we are using a representative `r p_vis*100`% subset in order to look for relationships in the data. 
+
+```{r vis1, message=FALSE, warning=FALSE, out.width='75%', fig.cap='Density'}
+
+neo_vis %>% ggplot(aes(absolute_magnitude, fill = is_hazardous, alpha = 0.1)) +
+  geom_density() + 
+  theme(legend.position = "top") +
+  guides(alpha = "none")
+
+```
+
+As you can see in the Figure 1, the density of *absolute_magnitude* shows an interesting insight. All hazardous objects have a magnitude $\leq$ `r neo %>% filter(is_hazardous == TRUE) %>% select(absolute_magnitude) %>% max() %>% round(digits = 2)`. This indicates that it could be a valuable feature in our later analysis.
+
+
+```{r vis2, message=FALSE, warning=FALSE, out.width='75%', fig.cap='Relationship'}
+
+plot1 <- neo_vis %>% ggplot(aes(miss_distance, absolute_magnitude, color = is_hazardous, alpha = 0.1)) +
+  geom_point() + 
+  theme(legend.position = "top") +
+  guides(alpha = "none")
+
+plot2 <- neo_vis %>% ggplot(aes(relative_velocity, absolute_magnitude, color = is_hazardous, alpha = 0.1)) +
+  geom_point() + 
+  ylab(NULL) +
+  theme(legend.position = "top") +
+  guides(alpha = "none")
+
+grid.arrange(plot1, plot2, nrow = 1)
+rm(plot1, plot2)
+```
+
+As you can see in Figure 2, there is evidence of clustering. This, together with what we found in Figure 1,  indicates that decision tree based models, like Rpart, could be quite useful on this data.
+
+## Measuring Accuracy
+
+There are many approaches of measuring error. But because *is_hazardous* is a binary variable, the predicted value can either be identical to the actual value or not. Therefore it makes sense to measure the accuracy in percent.
+
+We will measure the accuracy of our model using the following formula: $$ \textbf{Accuracy} = \frac{1}{n}\sum_{i = 1}^{n}{f(\hat{y}_i, y_i)} \quad \text{where} \quad f(x_1,x_2) = \begin{cases} 1&x_1=x_2\\0&x_1\not=x_2\end{cases}$$ In this formula $\hat{y}$ are the actual values and *y* are the predicted. Translated into code it looks like this:
+
+```{r accuracy, echo=TRUE}
+ accuracy <- function(y_actual, y_predicted) {
+   mean(ifelse(y_actual == y_predicted, 1, 0))
+ }
+```
+
+## Train / Test set
+
+```{r Subset, include=FALSE}
+set.seed(1234, sample.kind = "Rounding")
+p <- 0.2
+index <- createDataPartition(y = neo$is_hazardous, p = p, list = FALSE)
+neo_train <- neo[-index,]
+neo_test <- neo[index,]
+rm(index)
+```
+
+In order to train and test our model we will partition the data into `r (1-p)*100`% and `r p*100`% subsets.
+
+-   **Training set** - will be used to train the algorithm *(`r (1-p)*100`%, `r nrow(neo_train)` observations)*
+-   **Test set** - will be used to validate the algorithms accuracy *(`r p*100`%, `r nrow(neo_test)` observations)*
+
+`r rm(p)`
+
+## A Trivial Approach
+
+```{r trivial model, fig.cap='Hazardous Rate', message=FALSE, warning=FALSE, out.width='50%'}
+mean <- mean(neo_train$is_hazardous)
+
+acc_trivial <- accuracy(neo_test$is_hazardous, round(mean))
+
+#The logical values are used here just for better visualization
+
+neo_train %>% ggplot(aes(is_hazardous)) + 
+  geom_bar(aes(y = (after_stat(count))/sum(after_stat(count)))) + 
+  geom_hline(yintercept = mean) + 
+  xlab("Is Hazardous") + 
+  ylab("Percentage")
+```
+
+As you can see in Figure 3, most objects are not hazardous. So, the most basic model we can think of is predicting whether a object is hazardous or not with the mean (`r mean`). Because *is_hazardous* is a binary and not a continuous numerical variable we round it to `r round(mean)`.
+
+```{r trivail output}
+results <- tibble(Model = "Trivial", Accuracy = acc_trivial, Goal = acc_trivial > goal_accuracy)
+results
+```
+
+This gives us an accuracy of `r round(acc_trivial*100, digits = 2)`% straight out of the box. However this isn't quite worth celebrating, because we are basically just predicting all the hazardous objects wrong. You can see it when we add the Accuracy of the model and the Mean of the Data as it will give us approximately 1. So in a real world application, this model could result in catastrophic events.
+
+## Modelbuilding
+
+### Recursive Partitioning (Rpart)
+
+Because of the data distribution of some features like *absolute_magnitude* Rpart is a great algorithm to start our model building process.
+
+The Rpart algorithm uses a decision tree, like you can see in Figure 4, to classify the input and predict an outcome.
+
+```{r rpart, message=FALSE, warning=FALSE, fig.cap="Rpart decision tree", out.width='75%', cache=TRUE}
+model_rpart <- train(factor(is_hazardous) ~ ., data = neo_train, method = "rpart")
+
+rpart_pred <- predict(model_rpart, neo_test)
+
+rpart.plot(model_rpart$finalModel)
+
+acc_rpart <- accuracy(rpart_pred, neo_test$is_hazardous)
+```
+
+```{r rpart importance, fig.cap='Rpart Feature Importance', out.width='75%'}
+plot(varImp(model_rpart))
+```
+
+
+You can see in the decision tree (Figure 4) and in Figure 5, on what features the algorithm relies. As indicated before in the data exploration, *absolute_magnitude* has the greatest impact on the model.
+
+```{r rpart output}
+results <- bind_rows(results, tibble(Model = "Rpart", Accuracy = acc_rpart, Goal = acc_rpart > goal_accuracy))
+results
+```
+
+This Rpart model uses just the default parameters and is already achieving an accuracy of $\approx$ `r round(acc_rpart*100, digits = 2)`%. The Rpart algorithm has achieved a slightly better accuracy than the trivial, but not good enough.
+
+
+### Gradient Boosting (GBM)
+
+Gradient Boost relies on  decision trees internally. When new trees are being added while training, the gradient decent is calculated in order to minimize the loss while previously added trees keep untouched. [[4]](https://machinelearningmastery.com/gentle-introduction-gradient-boosting-algorithm-machine-learning/)
+
+We are using the data subset we were using earlier to visualize the data to find the best fit parameters for the model.
+
+```{r trSetup}
+trControl <- trainControl(method = "cv", number = 10)
+```
+
+```{r best_gbm, fig.cap='Best tune', out.width='75%', cache=TRUE}
+
+gbm_grid <- expand.grid(interaction.depth = c(3:6), n.trees = (1:30)*50, shrinkage = 0.1, n.minobsinnode = 10)
+
+model_gbm_tune <- train(factor(is_hazardous) ~ ., data = neo_vis, method = "gbm", tuneGrid = gbm_grid, verbose = FALSE)
+
+gbm_best <- model_gbm_tune$bestTune
+ggplot(model_gbm_tune, highlight = TRUE)
+```
+
+You can see in Figure 6 how the models accuracy changes throughout the training and what are best parameters are:
+
+```{r}
+gbm_best
+```
+
+Using these Parameters we will train the model on the train dataset with crossvalidation to prevent overfitting.
+
+```{r gbm, message=FALSE, warning=FALSE, cache=TRUE}
+set.seed(522, sample.kind = "Rounding")
+
+model_gbm <- train(factor(is_hazardous) ~ ., data = neo_train, method = "gbm", trControl = trControl, tuneGrid = gbm_best, verbose = FALSE)
+gbm_pred <- predict(model_gbm, neo_test)
+
+acc_gbm <- accuracy(gbm_pred, neo_test$is_hazardous)
+```
+
+```{r gbm output}
+results <- bind_rows(results, tibble(Model = "Gradient Boost", Accuracy = acc_gbm, Goal = acc_gbm > goal_accuracy))
+results
+```
+
+We are able to achieve an accuracy of `r round(acc_gbm*100, digits = 2)`%. But we can do better.
+
+### Random Forest
+
+As our next step we are turning to an algorithm called Random Forest. Random Forest is an ensemble algorithm which consists of multiple low or uncorrelated decision trees and utilizes majority voting to predict the final result. Because of this ensemble of the uncorrelated decision trees it reduces the risk of overfitting the data[[5]](https://www.ibm.com/topics/random-forest).
+
+As for Gradient Boost, we are using the visualization subset to find the best fit parameters for the model.
+
+```{r best_rf, cache=TRUE}
+rf_grid <- data.frame(mtry = seq(1,6))
+
+model_rf_tune <- train(factor(is_hazardous) ~ ., data = neo_vis, method = "rf", tuneGrid = rf_grid)
+
+rf_best <- model_rf_tune$bestTune
+
+```
+The best tune parameter for our Random Forrest algorithm is mtry = `r rf_best$mtry`.
+
+Using these Parameters we will train the model on the train dataset.
+
+```{r rf, message=FALSE, warning=FALSE, cache=TRUE}
+set.seed(568, sample.kind = "Rounding")
+
+model_rf <- train(factor(is_hazardous) ~ ., data = neo_train, 
+                  method = "rf", trControl = trControl, tuneGrid = rf_best)
+
+rf_pred <- predict(model_rf, neo_test)
+
+acc_rf <- accuracy(rf_pred, neo_test$is_hazardous)
+```
+
+
+```{r rf output}
+results <- bind_rows(results, tibble(Model = "Random Forest", Accuracy = acc_rf, Goal = acc_rf > goal_accuracy))
+results
+```
+
+We are able to achieve an accuracy of `r round(acc_rf*100, digits = 2)`%.
+
+\newpage{}
+
+# Results
+
+```{r result}
+results
+acc_final <- max(results$Accuracy)
+name_final <- results$Model[which.max(results$Accuracy)]
+```
+
+As you can see we reached our goal using our final model, `r name_final`, with a accuracy of `r round(acc_final*100, digits = 2)`% on the test set.
+
+```{r featureImportance, fig.cap='Random Forest Feature Importance', out.width='75%'}
+plot(varImp(model_rf))
+```
+
+As you can see in Figure 7, The Random Forest algorithm uses *neo_id* as most important feature compared to our Rpart model.
+
+
+
+# Conclusion
+
+In this Project we have tried to predict if a NEO could pose a threat upon Earth based on given parameters.
+Our goal was to achieve an accuracy $\geq$ `r goal_accuracy*100`%. We could accomplish this goal using the `r name_final` algorithm reaching an accuracy of `r round(acc_final*100, digits = 2)`%.
+
+We had 8 features included in the Dataset, however with additional data on the NEO's we could still improve our model further.
+
+\newpage{}
+
+# References
+
+[[1]](https://www.kaggle.com/datasets/ivansher/nasa-nearest-earth-objects-1910-2024/data) : Ivansher, Kaggle [online] <https://www.kaggle.com/datasets/ivansher/nasa-nearest-earth-objects-1910-2024/data>
+[Last Access: Sept 23 2024, Data downloaded: Sept 08 2024]
+
+
+
+[[2]](https://github.com/Fuechselbruezel/HarvardX-Capstone-CYO) : <https://github.com/Fuechselbruezel/HarvardX-Capstone-CYO>
+
+
+
+[[3]](https://cneos.jpl.nasa.gov/about/basics.html): Nasa Jet Propulsion Laboratory: *NEO Basics*, NASA [online] <https://cneos.jpl.nasa.gov/about/basics.html> [Last Access: Oct 04 2024]
+
+
+
+[[4]](https://machinelearningmastery.com/gentle-introduction-gradient-boosting-algorithm-machine-learning/) : Brownlee J.(08/15/2015): *A Gentle Introduction to the Gradient Boosting Algorithm for Machine Learning*, Machine Learning Mastery [online] <https://machinelearningmastery.com/gentle-introduction-gradient-boosting-algorithm-machine-learning/> [Last Access: Oct 04 2024]
+
+
+
+[[5]](https://www.ibm.com/topics/random-forest): IBM : *What is Random Forest?*, IBM [online] <https://www.ibm.com/topics/random-forest> [Last Access: Oct 04 2024]
